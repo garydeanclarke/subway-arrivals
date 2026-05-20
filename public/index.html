@@ -47,10 +47,26 @@
       border-radius: 10px;
       color: #e6edf3;
       font-size: 15px;
-      padding: 10px 14px 10px 38px;
+      padding: 10px 42px 10px 38px;
       outline: none;
       transition: border-color 0.2s;
     }
+
+    .geo-btn {
+      position: absolute;
+      right: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-size: 16px;
+      color: #6e7681;
+      padding: 4px;
+      line-height: 1;
+      transition: color 0.2s;
+    }
+    .geo-btn:hover { color: #e6edf3; }
 
     .search-input:focus { border-color: #58a6ff; }
     .search-input::placeholder { color: #484f58; }
@@ -137,6 +153,45 @@
       padding: 8px 20px;
       font-size: 12px;
     }
+
+    /* ── Service alerts ── */
+    .alerts-section {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 20px;
+    }
+
+    .alert-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      margin-top: 12px;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .alert-critical { background: rgba(248,81,73,.1);  border: 1px solid rgba(248,81,73,.3); }
+    .alert-warning  { background: rgba(210,153,34,.1); border: 1px solid rgba(210,153,34,.3); }
+    .alert-info     { background: rgba(88,166,255,.1); border: 1px solid rgba(88,166,255,.3); }
+
+    .alert-badge {
+      flex-shrink: 0;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      padding: 2px 7px;
+      border-radius: 4px;
+      margin-top: 1px;
+    }
+
+    .alert-critical .alert-badge { background: rgba(248,81,73,.25);  color: #f85149; }
+    .alert-warning  .alert-badge { background: rgba(210,153,34,.25); color: #d29922; }
+    .alert-info     .alert-badge { background: rgba(88,166,255,.25); color: #58a6ff; }
+
+    .alert-text { color: #c9d1d9; }
 
     /* ── Train grid ── */
     .grid {
@@ -241,6 +296,7 @@
       placeholder="Search for a station…"
       autocomplete="off"
     >
+    <button class="geo-btn" id="geoBtn" title="Find nearest station">📍</button>
     <div class="dropdown" id="dropdown"></div>
   </div>
 
@@ -254,6 +310,7 @@
 </header>
 
 <div id="errorBanner" class="error-banner" style="display:none"></div>
+<div id="alerts" class="alerts-section"></div>
 <div id="grid" class="grid"><div class="loading">Loading arrivals…</div></div>
 
 <script>
@@ -333,6 +390,17 @@ function renderCard(line, byHeadsign) {
     </div>`;
 }
 
+function renderAlerts(alerts) {
+  const el = document.getElementById('alerts');
+  if (!alerts?.length) { el.innerHTML = ''; return; }
+  el.innerHTML = alerts.map(a =>
+    `<div class="alert-item alert-${a.severity}">
+      <span class="alert-badge">${a.effectLabel}</span>
+      <span class="alert-text">${a.header}</span>
+    </div>`
+  ).join('');
+}
+
 function render(data) {
   // Group arrivals by line → headsign
   const byLine = {};
@@ -355,6 +423,8 @@ function render(data) {
   document.getElementById('grid').innerHTML = html;
   document.getElementById('updated').textContent =
     `Updated ${new Date(data.updated).toLocaleTimeString()}`;
+
+  renderAlerts(data.alerts);
 
   const banner = document.getElementById('errorBanner');
   if (data.feedErrors?.length) {
@@ -387,9 +457,15 @@ function selectStation(station) {
   currentStation = station;
   saveStation(station);
 
+  // Update URL so the page is shareable
+  const url = new URL(window.location);
+  url.searchParams.set('station', station.name);
+  history.replaceState({}, '', url);
+
   document.getElementById('stationName').textContent = station.name;
   document.title = `${station.name} — Arrivals`;
   document.getElementById('grid').innerHTML = `<div class="loading">Loading arrivals…</div>`;
+  document.getElementById('alerts').innerHTML = '';
 
   clearInterval(refreshTimer);
   refresh();
@@ -404,16 +480,38 @@ async function initStations() {
     console.warn('Could not load stations:', err.message);
   }
 
-  // Restore or default to Atlantic Av-Barclays Ctr
-  const saved = loadSavedStation();
-  const match = saved && allStations.find(s => s.name === saved.name);
+  // Priority: URL param → localStorage → default
+  const urlParam = new URLSearchParams(location.search).get('station');
+  const saved    = loadSavedStation();
+
   const defaultStation =
-    match ||
+    (urlParam && allStations.find(s => s.name === urlParam)) ||
+    (saved    && allStations.find(s => s.name === saved.name)) ||
     allStations.find(s => s.name === 'Atlantic Av-Barclays Ctr') ||
     allStations[0];
 
   if (defaultStation) selectStation(defaultStation);
 }
+
+// ── Geolocation ──
+document.getElementById('geoBtn').addEventListener('click', () => {
+  if (!navigator.geolocation) return;
+  const btn = document.getElementById('geoBtn');
+  btn.textContent = '⏳';
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      btn.textContent = '📍';
+      const { latitude: lat, longitude: lon } = pos.coords;
+      let nearest = null, minDist = Infinity;
+      for (const s of allStations) {
+        const d = (s.lat - lat) ** 2 + (s.lon - lon) ** 2;
+        if (d < minDist) { minDist = d; nearest = s; }
+      }
+      if (nearest) selectStation(nearest);
+    },
+    () => { btn.textContent = '📍'; }
+  );
+});
 
 const searchInput = document.getElementById('searchInput');
 const dropdown   = document.getElementById('dropdown');

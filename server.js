@@ -6,8 +6,9 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const GTFS_STATIC_URL = 'http://web.mta.info/developers/data/nyct/subway/google_transit.zip';
-const LIRR_FEED_URL = 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/lirr%2Fgtfs-lirr';
+const GTFS_STATIC_URL  = 'http://web.mta.info/developers/data/nyct/subway/google_transit.zip';
+const LIRR_FEED_URL    = 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/lirr%2Fgtfs-lirr';
+const ALERTS_FEED_URL  = 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/camsys%2Fsubway-alerts';
 
 // LIRR stop IDs for Atlantic Terminal → Jamaica filter
 const LIRR_ATLANTIC_STOP = '349';
@@ -41,6 +42,86 @@ function feedUrlForStopId(stopId) {
   if ('NQRW'.includes(p))           return 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-nqrw';
   if (p === 'S')                    return 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-si';
   return null;
+}
+
+// Routes that could serve a stop, derived from stop ID prefix
+function routesForStopIds(parentStopIds) {
+  const routes = new Set();
+  const prefixMap = {
+    A: ['A','C','E'], C: ['A','C','E'], H: ['A','C','E'],
+    B: ['B','D'],     D: ['B','D'],
+    F: ['F','M'],     M: ['F','M'],
+    G: ['G'],
+    J: ['J','Z'],     Z: ['J','Z'],
+    L: ['L'],
+    N: ['N','Q','R','W'], Q: ['N','Q','R','W'],
+    R: ['N','Q','R','W'], W: ['N','Q','R','W'],
+    S: ['SI'],
+  };
+  for (const id of parentStopIds) {
+    if (/^\d/.test(id)) ['1','2','3','4','5','6','7'].forEach(r => routes.add(r));
+    else (prefixMap[id[0].toUpperCase()] || []).forEach(r => routes.add(r));
+  }
+  return routes;
+}
+
+// --- Alerts ---
+
+const EFFECT_LABELS = {
+  1: 'No Service', 2: 'Reduced Service', 3: 'Delays',
+  4: 'Detour',     5: 'Extra Service',   6: 'Modified Service',
+  7: 'Alert',      8: 'Alert',           9: 'Stop Moved',
+  10: 'Info',      11: 'Accessibility',
+};
+
+const EFFECT_SEVERITY = {   // used by frontend for color-coding
+  1: 'critical', 2: 'critical', 3: 'warning',
+  4: 'warning',  6: 'warning',  9: 'warning',
+  5: 'info',     10: 'info',    11: 'info',
+};
+
+function getEnglishText(ts) {
+  if (!ts?.translation?.length) return '';
+  const t = ts.translation.find(t => !t.language || t.language === 'en') || ts.translation[0];
+  return t?.text || '';
+}
+
+function extractAlerts(feedObj, routeIds, parentStopIds) {
+  const now = Math.floor(Date.now() / 1000);
+  const stopIdSet = new Set(parentStopIds);
+  const alerts = [];
+
+  for (const entity of feedObj.entity || []) {
+    const alert = entity.alert;
+    if (!alert) continue;
+
+    // Must be currently active
+    const periods = alert.activePeriod || [];
+    const active = !periods.length || periods.some(p =>
+      now >= (p.start || 0) && now <= (p.end || Infinity)
+    );
+    if (!active) continue;
+
+    // Must affect one of our routes or stops
+    const relevant = (alert.informedEntity || []).some(ie =>
+      (ie.routeId && routeIds.has(ie.routeId)) ||
+      (ie.stopId  && stopIdSet.has(ie.stopId.replace(/[NS]$/, '')))
+    );
+    if (!relevant) continue;
+
+    const header = getEnglishText(alert.headerText);
+    if (!header) continue;
+
+    alerts.push({
+      effect:      alert.effect || 7,
+      effectLabel: EFFECT_LABELS[alert.effect] || 'Alert',
+      severity:    EFFECT_SEVERITY[alert.effect] || 'warning',
+      header,
+      description: getEnglishText(alert.descriptionText),
+    });
+  }
+
+  return alerts;
 }
 
 // --- Station database ---
@@ -216,15 +297,23 @@ app.get('/api/arrivals', async (req, res) => {
 
   const feedUrls = [...new Set(parentStopIds.map(feedUrlForStopId).filter(Boolean))];
   const isAtlantic = parentStopIds.some(id => ATLANTIC_PARENT_STOPS.has(id));
+  const routeIds = routesForStopIds(parentStopIds);
 
-  const tasks = feedUrls.map(url =>
+  const arrivalTasks = feedUrls.map(url =>
     fetchAndParse(url).then(feed => extractSubwayArrivals(feed, parentStopIds))
   );
   if (isAtlantic) {
-    tasks.push(fetchAndParse(LIRR_FEED_URL).then(feed => extractLIRRJamaicaArrivals(feed)));
+    arrivalTasks.push(fetchAndParse(LIRR_FEED_URL).then(feed => extractLIRRJamaicaArrivals(feed)));
   }
 
-  const results = await Promise.allSettled(tasks);
+  // Fetch alerts in parallel with arrivals; never let it block the response
+  const [results, alerts] = await Promise.all([
+    Promise.allSettled(arrivalTasks),
+    fetchAndParse(ALERTS_FEED_URL)
+      .then(feed => extractAlerts(feed, routeIds, parentStopIds))
+      .catch(() => []),
+  ]);
+
   const errors = results.filter(r => r.status === 'rejected').map(r => r.reason.message);
   if (errors.length) console.warn('Feed errors:', errors.join(' | '));
 
@@ -233,7 +322,7 @@ app.get('/api/arrivals', async (req, res) => {
     .flatMap(r => r.value)
     .sort((a, b) => a.minutes - b.minutes);
 
-  const data = { updated: Date.now(), arrivals, feedErrors: errors };
+  const data = { updated: Date.now(), arrivals, alerts, feedErrors: errors };
   arrivalCache.set(cacheKey, { at: Date.now(), data });
   res.json(data);
 });
